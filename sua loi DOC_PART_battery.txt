@@ -1,0 +1,13 @@
+#currentcapacity=$(system_profiler SPPowerDataType | awk '/Capacity/ {print $5}')
+RAW_DATA=$(ioreg -rw0 -c AppleSmartBattery)
+#currentcapacity=$(ioreg -r -c "AppleSmartBattery" | grep -o '"CurrentCapacity" = [0-9]*' | sed 's/"CurrentCapacity" = //')
+currentcapacity=$(echo "$RAW_DATA" | awk -F'= ' '/"AppleRawMaxCapacity" =/ {print $2}')
+if [ -z "$currentcapacity" ] || [ "$currentcapacity" == "0" ]; then
+    currentcapacity=$(echo "$RAW_DATA" | awk -F'= ' '/"MaxCapacity" =/ {print $2}')
+fi
+designcapacity=$(echo "$RAW_DATA" | awk -F'= ' '/"DesignCapacity" =/ {print $2}')
+#designcapacity=$(ioreg -r -c "AppleSmartBattery" | grep -w '"DesignCapacity" =' | awk '/DesignCapacity/ {print $3}')
+condition=$(system_profiler SPPowerDataType | grep "Condition:" | sed 's/.*Condition: //')
+#cyclecount=$(system_profiler SPPowerDataType | awk '/Cycle Count/ {print $3}')
+cyclecount=$(echo "$RAW_DATA" | awk -F'= ' '/"CycleCount" =/ {print $2}')
+for i in {0..5}

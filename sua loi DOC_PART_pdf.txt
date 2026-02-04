@@ -1,0 +1,11 @@
+sleep 1
+CHROME='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+    if [ -f "$CHROME" ]; then
+        echo "...Printing via Google Chrome (Headless)..."
+        #"$CHROME" --headless --disable-gpu --no-pdf-header-footer --print-to-pdf="$pdf_file" --no-margins "$html_file" > /dev/null 2>&1
+        "$CHROME" --headless --disable-gpu --no-pdf-header-footer --print-to-pdf="$HOME/Documents/"$ssn".pdf" --no-margins "$HOME/Documents/"$ssn".html"
+    else
+        echo "...Chrome not found. Printing via System cupsfilter..."
+        cupsfilter -i text/html -o media=Custom.4x1in "$html_file" > "$pdf_file" 2>/dev/null
+    fi
+sleep 2
