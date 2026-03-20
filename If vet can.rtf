@@ -1,0 +1,17 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2868
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 # Th\'eam \uc0\u273 o\u7841 n n\'e0y v\'e0o sau c\'f9ng c\'e1c l\u7879 nh if ki\u7875 m tra Motherboard\
+if [ "$part" == "Motherboard" ] && [ "$info2" == *"Motherboard"* ]\
+then\
+    # N\uc0\u7871 u \u273 \u7871 n \u273 \'e2y m\'e0 info2 v\u7851 n ch\u7881  c\'f3 ch\u7919  Motherboard (ngh\u297 a l\'e0 c\'e1c \u273 i\u7873 u ki\u7879 n tr\'ean t\u7841 ch h\u7871 t)\
+    # th\'ec \'e9p n\'f3 l\uc0\u7845 y th\'f4ng tin c\u7911 a M1/M2/M3 lu\'f4n\
+    addr=$(echo $addr\\&ssn=$ssn\\&cpu=$cpu\\&memory=$memory\\&hddsize=$hddsize)\
+    info1=$(echo $ssn)\
+    info2=$(echo $\{selectedpart[@]\} $cpu $memory $hddsize)\
+fi\
+# m\uc0\u7899 i v\u7915 a th\'eam \u273 \u7875  test th\u7917 }
