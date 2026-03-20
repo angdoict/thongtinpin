@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# Thiết lập màu sắc
+CYAN='\033[36;1m'
+YELLOW='\033[33;1m'
+GREEN='\033[32;1m'
+RED='\033[31;1m'
+NC='\033[0m'
+
+# Tự động di chuyển vào thư mục chứa file
+cd "$(dirname "$0")"
+
+echo -e "${CYAN}--- Process in progress ---${NC}"
+
+# Bật Wifi và kết nối
+networksetup -setairportpower en0 on 2>/dev/null
+echo -e "${YELLOW}Initiating Wifi handshake...${NC}"
+networksetup -setairportnetwork en0 "Meepo Tek" hungtran 2>/dev/null
+
+sleep 5
+
+echo -e "${CYAN}--- Time sync ---${NC}"
+sudo -S <<< 595111 sntp -sS time.apple.com
+
+echo ""
+echo -e "${CYAN}======== MDM RESULT =========${NC}"
+
+# Chạy lệnh kiểm tra và lưu vào biến
+CHECK_DEP=$(sudo -S <<< 1234 profiles show -type enrollment 2>&1)
+
+if [[ "$CHECK_DEP" == *"is not DEP enabled"* ]]; then
+    echo -e "${GREEN} \033[1m>>> RESULT: MDM OFF (Client is NOT DEP enabled)${NC}"
+    echo -e "${GREEN} \033[1m>>> RESULT: MDM OFF (Client is NOT DEP enabled)${NC}"
+else
+    echo -e "${RED} \033[1m>>> WARNING: MDM ON / DEP${NC}"
+    echo -e "${RED} \033[1m>>> WARNING: MDM ON / DEP${NC}"
+    echo "$CHECK_DEP"
+fi
+echo -e "${YELLOW}Waiting 3 seconds to read result...${NC}"
+sleep 3
+echo -e "${CYAN}=======================================${NC}"
+echo ""
+
+echo -e "${CYAN}--- Accessing hardware diagnostic tool via browser ---${NC}"
+if open -Ra "Google Chrome"; then
+    open -a "Google Chrome" "https://retest.us"
+    #open -a "Google Chrome" "https://deadpixeltest.org"
+else
+    open "https://retest.us"
+    #open "https://deadpixeltest.org"
+fi
+
+echo -e "${CYAN}-- Ping test ---${NC}"
+ping -c 5 google.com
+
+echo -e "${GREEN}--- COMPLETE ---${NC}"
+#say "Setup complete" 2>/dev/null
+
+# Giữ cửa sổ Terminal mở để xem kết quả
+read -p "Press Enter to exit..."
+exit 0
