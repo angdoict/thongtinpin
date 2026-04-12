@@ -1,0 +1,6 @@
+#!/bin/bash
+# --- CONNECT & CHECK WIFI ---
+networksetup -setairportnetwork en0 "Meepo Tek" "hungtran" 2>/dev/null
+sleep 2
+[[ "$(networksetup -getairportnetwork en0)" != *"Meepo Tek"* ]] && echo -e "\033[31mWrong Wifi! Exit.\033[0m" && exit 1
+# ----------------------------
