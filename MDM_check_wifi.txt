@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# Thiết lập màu sắc
+CYAN='\033[36;1m'
+YELLOW='\033[33;1m'
+GREEN='\033[32;1m'
+RED='\033[31;1m'
+NC='\033[0m'
+
+# Tự động di chuyển vào thư mục chứa file
+cd "$(dirname "$0")"
+
+echo -e "${CYAN}--- Process in progress ---${NC}"
+
+# Bật Wifi và kết nối
+# networksetup -setairportpower en0 on 2>/dev/null
+sleep 3
+echo -e "${YELLOW}Initiating Wifi handshake...${NC}"
+networksetup -setairportnetwork en0 "Meepo Tek" hungtran 2>/dev/null
+# Chờ 2 giây để hệ thống cập nhật trạng thái
+sleep 3
+
+# KIỂM TRA CHÍNH XÁC TÊN WIFI
+CURRENT_WIFI=$(networksetup -getairportnetwork en0 | awk -F ": " '{print $2}')
+
+if [[ "$CURRENT_WIFI" != "Meepo Tek" ]]; then
+    echo -e "${RED}Error: Not connected to 'Meepo Tek'. Current: [$CURRENT_WIFI]${NC}"
+    echo -e "${RED}Exiting to prevent false MDM result...${NC}"
+    exit 1
+else
+    echo -e "${GREEN}Connected to 'Meepo Tek' successfully!${NC}"
+fi
