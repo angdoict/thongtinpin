@@ -1,0 +1,19 @@
+
+###echo 'Enter Note: '
+# --- CHỈ HIỆN MENU MÀU NẾU LÀ LCD HOẶC HOUSING ---
+color="" # Khởi tạo biến màu rỗng
+if [[ "$part" == "LCD" || "$part" == "Housing" ]]; then
+    colors=(-Silver- -Gray- -Gold- Exit)
+    PS3='1 to 4, chon mau: '
+    select c in "${colors[@]}" ; do
+        if [ "$c" == "Exit" ]; then exit 0; fi
+        [[ -n "$c" ]] && color="$c " && break
+        
+    done
+fi
+# -----------------------------------------------
+echo 'Enter Note: '
+read input_note
+note="${color}${input_note}"
+echo -e Note: "$note"
+####
