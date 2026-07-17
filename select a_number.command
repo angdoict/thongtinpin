@@ -6,6 +6,7 @@ ipconfig getifaddr en0
 diskutil apfs deleteContainer disk7
 
 diskutil apfs resizeContainer disk5 25g
+diskutil partitionDisk disk4 GPT APFS "Install macOS Tahoe" 40g
 
 select_anumber() {
     while true; do
