@@ -3,6 +3,10 @@ brew install shc
 
 ipconfig getifaddr en0
 
+diskutil apfs deleteContainer disk7
+
+diskutil apfs resizeContainer disk5 25g
+
 select_anumber() {
     while true; do
         read -p "1. Enter A-Number (e.g., A2141): " input
