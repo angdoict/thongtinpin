@@ -1,0 +1,20 @@
+
+system_profiler SPCameraDataType
+ioreg -l | grep -i -E "camera|facetime"
+log stream --predicate 'eventMessage CONTAINS[c] "camera"' --level debug
+tccutil reset Camera
+5. Reset SMC (máy T2)
+----------
+Tắt máy. Giữ Control (trái) + Option (trái) + Shift (phải) trong 7 giây, rồi giữ thêm nút nguồn, tổng cộng khoảng 7 giây nữa. Thả tay, đợi vài giây rồi bật lại máy.
+
+6. Apple Diagnostics
+
+Khởi động lại máy và giữ phím D ngay khi bật. Nếu ra mã lỗi liên quan camera hoặc display thì gần như chắc chắn là phần cứng.
+ mở Photo Booth.app
+Chạy lệnh dưới, sau đó mở Photo Booth:
+
+log stream --predicate 'eventMessage CONTAINS[c] "camera"' --level debug
+
+3. Reset quyền camera
+
+tccutil reset Camera
