@@ -1,0 +1,555 @@
+<#
+fix-4x1.ps1 - Diagnose / recover the 4B-2054K network label printer used by printer.ps1
+(Meepotek print agent). Run in an ADMIN PowerShell on the warehouse Windows PC.
+
+SAFE BY DEFAULT: without -Fix it only READS and reports. Nothing is changed.
+
+  Diagnose only (read-only):
+    powershell -ExecutionPolicy Bypass -File fix-4x1.ps1
+  Recover (asks before every change):
+    powershell -ExecutionPolicy Bypass -File fix-4x1.ps1 -Fix
+  Recover + offer to delete stuck 4B-2054K jobs (CSV saved first, asks y/N PER JOB):
+    powershell -ExecutionPolicy Bypass -File fix-4x1.ps1 -Fix -RemoveStuckJobs
+
+What -Fix does, in order, stopping as soon as the queue drains:
+  1. Printer unreachable (ping / RAW 9100)  -> change NOTHING, tell you to power-cycle it.
+  2. "Use Printer Offline" is on             -> turn it off, wait, re-check.
+  3. Jobs still stuck                        -> stop agent service -> stop Spooler ->
+     copy spool files to a backup folder -> start Spooler -> wait for drain ->
+     (only with -RemoveStuckJobs: delete jobs you confirm one by one) -> start agent.
+     Spooler and agent are ALWAYS started again, even if a step fails.
+Print jobs are never deleted unless -RemoveStuckJobs is given AND you answer y for that job.
+-Yes only auto-answers the safe questions; risky ones (other printer busy, delete job) still ask.
+#>
+[CmdletBinding()]
+param(
+    [string]$PrinterName = "4B-2054K",
+    [string]$PrinterIp = "10.1.10.245",
+    [int]$RawPort = 9100,
+    [string]$AgentServiceName = "",
+    [string]$WorkDir = "C:\Users\Meepo\Desktop\PrintAgent",
+    [int]$StuckMinutes = 3,
+    [int]$DrainWaitSeconds = 30,
+    [switch]$Fix,
+    [switch]$RemoveStuckJobs,
+    [switch]$Yes,
+    [switch]$LibOnly
+)
+
+$ErrorActionPreference = "Stop"
+$script:LogPath = $null
+$script:OutDir = $null
+$script:Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+
+# ------------------------------------------------------------------ helpers
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $line = "[{0}] {1,-5} {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    $color = "Gray"
+    if ($Level -eq "WARN") { $color = "Yellow" }
+    elseif ($Level -eq "ERROR") { $color = "Red" }
+    elseif ($Level -eq "OK") { $color = "Green" }
+    elseif ($Level -eq "STEP") { $color = "Cyan" }
+    Write-Host $line -ForegroundColor $color
+    if ($script:LogPath) {
+        try { Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8 } catch {}
+    }
+}
+
+function Ask-User {
+    # -DefaultNo questions are risky: -Yes does NOT auto-answer them.
+    param([string]$Question, [switch]$DefaultNo)
+    if ($Yes -and -not $DefaultNo) {
+        Write-Log "$Question -> yes (-Yes)"
+        return $true
+    }
+    $hint = "[Y/n]"
+    if ($DefaultNo) { $hint = "[y/N]" }
+    $ans = ([string](Read-Host "$Question $hint")).Trim().ToLowerInvariant()
+    if (-not $ans) { $r = -not $DefaultNo } else { $r = ($ans -eq "y" -or $ans -eq "yes") }
+    $word = "no"
+    if ($r) { $word = "yes" }
+    Write-Log "$Question -> $word"
+    return [bool]$r
+}
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p = New-Object Security.Principal.WindowsPrincipal($id)
+    return [bool]$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Initialize-Output {
+    $dir = Join-Path $WorkDir "fix-4x1"
+    try {
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    } catch {
+        $dir = Join-Path $env:TEMP "fix-4x1"
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    }
+    $script:OutDir = $dir
+    $script:LogPath = Join-Path $dir ("log-{0}.txt" -f $script:Stamp)
+}
+
+# ------------------------------------------------------------------ network
+
+function Test-Ping {
+    param([string]$Ip)
+    try { return [bool](Test-Connection -ComputerName $Ip -Count 2 -Quiet -ErrorAction Stop) } catch { return $false }
+}
+
+function Test-TcpOpen {
+    param([string]$HostName, [int]$Port, [int]$TimeoutMs = 2000)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        $client.EndConnect($iar)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        try { $client.Close() } catch {}
+    }
+}
+
+function Test-RawPort {
+    # A busy printer may refuse one connect while it prints -> retry before calling it hung.
+    param([string]$Ip, [int]$Port, [int]$Tries = 3)
+    for ($i = 1; $i -le $Tries; $i++) {
+        if (Test-TcpOpen -HostName $Ip -Port $Port) { return $true }
+        if ($i -lt $Tries) { Start-Sleep -Seconds 2 }
+    }
+    return $false
+}
+
+# ------------------------------------------------------------------ printer / queue
+
+function Get-PrinterSnapshot {
+    param([string]$Name)
+    try { $p = Get-Printer -Name $Name -ErrorAction Stop } catch { return $null }
+    if (-not $p) { return $null }
+    $hostAddr = ""
+    try { $hostAddr = [string](Get-PrinterPort -Name $p.PortName -ErrorAction Stop).PrinterHostAddress } catch {}
+    $wo = $false
+    try {
+        $cim = Get-CimInstance -ClassName Win32_Printer -Filter ("Name='{0}'" -f $Name.Replace("'", "''")) -ErrorAction Stop
+        if ($cim) { $wo = [bool]$cim.WorkOffline }
+    } catch {}
+    return [pscustomobject]@{
+        Name        = [string]$p.Name
+        PortName    = [string]$p.PortName
+        Host        = $hostAddr
+        Status      = [string]$p.PrinterStatus
+        WorkOffline = $wo
+        Driver      = [string]$p.DriverName
+    }
+}
+
+function Set-PrinterOnline {
+    param([string]$Name)
+    $cim = Get-CimInstance -ClassName Win32_Printer -Filter ("Name='{0}'" -f $Name.Replace("'", "''")) -ErrorAction Stop
+    Set-CimInstance -InputObject $cim -Property @{ WorkOffline = $false } -ErrorAction Stop
+}
+
+function Get-QueueJobs {
+    param([string]$Name)
+    $out = @()
+    foreach ($j in @(Get-PrintJob -PrinterName $Name -ErrorAction Stop)) {
+        if (-not $j) { continue }
+        $sub = $null
+        try { if ($j.SubmittedTime) { $sub = [datetime]$j.SubmittedTime } } catch {}
+        $age = -1.0
+        if ($sub) { $age = [Math]::Round(((Get-Date) - $sub).TotalMinutes, 1) }
+        $out += [pscustomobject]@{
+            Printer   = $Name
+            Id        = [int]$j.Id
+            Document  = [string]$j.DocumentName
+            Status    = [string]$j.JobStatus
+            Submitted = $sub
+            AgeMin    = $age
+            Pages     = $j.TotalPages
+            User      = [string]$j.UserName
+        }
+    }
+    return $out
+}
+
+function Get-AllPrinterNames {
+    return @(Get-Printer -ErrorAction Stop | ForEach-Object { [string]$_.Name })
+}
+
+function Format-Job {
+    param($J)
+    return ("#{0} '{1}' status=[{2}] age={3}min pages={4}" -f $J.Id, $J.Document, $J.Status, $J.AgeMin, $J.Pages)
+}
+
+function Save-JobList {
+    param([object[]]$Jobs, [string]$Tag)
+    $path = Join-Path $script:OutDir ("jobs-{0}-{1}.csv" -f $Tag, $script:Stamp)
+    @($Jobs) | Select-Object Printer, Id, Document, Status, Submitted, AgeMin, Pages, User |
+        Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8
+    Write-Log "Saved job list ($(@($Jobs).Count)) -> $path"
+    return $path
+}
+
+function Test-SameJob {
+    # Job IDs can be reused: match Id AND document name.
+    param($A, $B)
+    return ([int]$A.Id -eq [int]$B.Id -and [string]$A.Document -eq [string]$B.Document)
+}
+
+function Select-StillPresent {
+    param([object[]]$Earlier, [object[]]$Now)
+    $keep = @()
+    foreach ($e in @($Earlier)) {
+        foreach ($n in @($Now)) {
+            if (Test-SameJob $e $n) { $keep += $n; break }
+        }
+    }
+    return $keep
+}
+
+# ------------------------------------------------------------------ agent / services
+
+function Find-AgentServiceNameFromRegistry {
+    # NSSM keeps the script arguments in ...\Services\<name>\Parameters\AppParameters
+    $base = "HKLM:\SYSTEM\CurrentControlSet\Services"
+    foreach ($k in @(Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue)) {
+        $ap = $null
+        try { $ap = (Get-ItemProperty -LiteralPath (Join-Path $k.PSPath "Parameters") -Name AppParameters -ErrorAction Stop).AppParameters } catch { continue }
+        if ([string]$ap -match 'printer\.ps1') { return [string]$k.PSChildName }
+    }
+    return $null
+}
+
+function Find-AgentService {
+    $name = $AgentServiceName
+    if (-not $name) { $name = Find-AgentServiceNameFromRegistry }
+    if (-not $name) { return $null }
+    try { return (Get-Service -Name $name -ErrorAction Stop) } catch { return $null }
+}
+
+function Get-AgentHealth {
+    $path = Join-Path $WorkDir "agent-health.json"
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $item = Get-Item -LiteralPath $path
+    $state = ""
+    try { $state = [string]((Get-Content -LiteralPath $path -Raw) | ConvertFrom-Json).state } catch {}
+    return [pscustomobject]@{
+        State     = $state
+        AgeSec    = [int]((Get-Date) - $item.LastWriteTime).TotalSeconds
+        WriteTime = $item.LastWriteTime
+    }
+}
+
+function Wait-AgentQuiet {
+    # Don't stop the agent while it is claiming / downloading / sending a job.
+    param([int]$MaxSec = 60)
+    $busy = @("claiming", "downloading", "printing", "update_check")
+    $deadline = (Get-Date).AddSeconds($MaxSec)
+    while ($true) {
+        $h = Get-AgentHealth
+        if (-not $h -or ($busy -notcontains $h.State)) { return $true }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Write-Log "Agent busy (state=$($h.State)) - waiting before stopping it"
+        Start-Sleep -Seconds 3
+    }
+}
+
+function Wait-ServiceStatus {
+    param([string]$Name, [string]$Status, [int]$MaxSec = 30)
+    $deadline = (Get-Date).AddSeconds($MaxSec)
+    while ($true) {
+        $s = [string](Get-Service -Name $Name -ErrorAction Stop).Status
+        if ($s -eq $Status) { return $true }
+        if ((Get-Date) -ge $deadline) { throw "service $Name did not reach $Status (now $s) in ${MaxSec}s" }
+        Start-Sleep -Seconds 1
+    }
+}
+
+function Get-SpoolDir {
+    try {
+        $d = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers" -Name DefaultSpoolDirectory -ErrorAction Stop).DefaultSpoolDirectory
+        if ($d) { return [string]$d }
+    } catch {}
+    return (Join-Path $env:windir "System32\spool\PRINTERS")
+}
+
+function Backup-SpoolFiles {
+    # COPY only (never move/delete). Spooler must be stopped so files are not locked.
+    $src = Get-SpoolDir
+    $dest = Join-Path $script:OutDir ("spool-backup-{0}" -f $script:Stamp)
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    $files = @(Get-ChildItem -LiteralPath $src -File -ErrorAction SilentlyContinue)
+    foreach ($f in $files) { Copy-Item -LiteralPath $f.FullName -Destination $dest -Force }
+    Write-Log "Backed up $($files.Count) spool file(s) from $src -> $dest"
+    return $files.Count
+}
+
+function Wait-QueueDrain {
+    # Returns the subset of $Stuck still in the queue after waiting.
+    param([object[]]$Stuck, [int]$MaxSec)
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $MaxSec))
+    while ($true) {
+        $now = @(Get-QueueJobs -Name $PrinterName)
+        $left = @(Select-StillPresent -Earlier $Stuck -Now $now)
+        if ($left.Count -eq 0 -or (Get-Date) -ge $deadline) { return $left }
+        Start-Sleep -Seconds 3
+    }
+}
+
+function Remove-ConfirmedJobs {
+    # Delete only jobs on $PrinterName that are STILL the same stuck job (Id + name), each confirmed.
+    param([object[]]$Candidates)
+    $removed = @()
+    if (@($Candidates).Count -eq 0) { return $removed }
+    Save-JobList -Jobs $Candidates -Tag "delete-candidates" | Out-Null
+    Write-Log "Deleting a job means that label will NOT print - reprint it from meepo.win afterwards." "WARN"
+    foreach ($c in @($Candidates)) {
+        $current = @(Select-StillPresent -Earlier @($c) -Now @(Get-QueueJobs -Name $PrinterName))
+        if ($current.Count -eq 0) {
+            Write-Log "Job $(Format-Job $c) already left the queue - skip"
+            continue
+        }
+        if (-not (Ask-User -Question "Delete stuck job $(Format-Job $current[0]) on $PrinterName ?" -DefaultNo)) { continue }
+        try {
+            Remove-PrintJob -PrinterName $PrinterName -ID ([int]$c.Id) -ErrorAction Stop
+            Write-Log "Deleted job $(Format-Job $c)" "WARN"
+            $removed += $c
+        } catch {
+            Write-Log "Could not delete job #$($c.Id): $($_.Exception.Message)" "ERROR"
+        }
+    }
+    if ($removed.Count -gt 0) { Save-JobList -Jobs $removed -Tag "DELETED-reprint-these" | Out-Null }
+    return $removed
+}
+
+function Invoke-SpoolerRecovery {
+    # stop agent -> stop spooler -> backup -> start spooler -> drain wait -> [delete] -> start agent
+    param($AgentSvc, [object[]]$Stuck)
+    $result = [pscustomobject]@{ Ok = $false; Left = @($Stuck); Removed = @() }
+    $agentName = $null
+    $agentWasRunning = $false
+    if ($AgentSvc) {
+        $agentName = [string]$AgentSvc.Name
+        $agentWasRunning = ([string]$AgentSvc.Status -eq "Running")
+    }
+    $spoolerDown = $false
+    try {
+        if ($agentWasRunning) {
+            Write-Log "Stopping agent service '$agentName'" "STEP"
+            Stop-Service -Name $agentName -Force -ErrorAction Stop
+            Wait-ServiceStatus -Name $agentName -Status "Stopped" | Out-Null
+        }
+        Write-Log "Stopping Spooler" "STEP"
+        Stop-Service -Name "Spooler" -Force -ErrorAction Stop
+        $spoolerDown = $true
+        Wait-ServiceStatus -Name "Spooler" -Status "Stopped" | Out-Null
+        Backup-SpoolFiles | Out-Null
+        Write-Log "Starting Spooler" "STEP"
+        Start-Service -Name "Spooler" -ErrorAction Stop
+        Wait-ServiceStatus -Name "Spooler" -Status "Running" | Out-Null
+        $spoolerDown = $false
+        Start-Sleep -Seconds 5
+
+        Write-Log "Waiting up to ${DrainWaitSeconds}s for stuck job(s) to print" "STEP"
+        $result.Left = @(Wait-QueueDrain -Stuck $Stuck -MaxSec $DrainWaitSeconds)
+        if ($result.Left.Count -eq 0) {
+            Write-Log "Queue drained after spooler restart" "OK"
+        } else {
+            Write-Log "$($result.Left.Count) job(s) still stuck after restart" "WARN"
+            foreach ($j in $result.Left) { Write-Log "  $(Format-Job $j)" "WARN" }
+            if ($RemoveStuckJobs) {
+                # Agent is still stopped here, so it cannot race us on these jobs.
+                $result.Removed = @(Remove-ConfirmedJobs -Candidates $result.Left)
+                $result.Left = @(Select-StillPresent -Earlier $result.Left -Now @(Get-QueueJobs -Name $PrinterName))
+            } else {
+                Write-Log "Not deleting anything (run with -RemoveStuckJobs to be offered deletion)."
+            }
+        }
+        $result.Ok = $true
+    } catch {
+        Write-Log "Recovery step failed: $($_.Exception.Message)" "ERROR"
+    } finally {
+        if ($spoolerDown) {
+            Write-Log "Safety: starting Spooler again" "WARN"
+            try { Start-Service -Name "Spooler" -ErrorAction Stop } catch { Write-Log "Spooler start FAILED: $($_.Exception.Message)" "ERROR" }
+        }
+        if ($agentWasRunning) {
+            Write-Log "Starting agent service '$agentName'" "STEP"
+            try {
+                Start-Service -Name $agentName -ErrorAction Stop
+                Wait-ServiceStatus -Name $agentName -Status "Running" | Out-Null
+                Write-Log "Agent running" "OK"
+            } catch {
+                Write-Log "Agent start FAILED: $($_.Exception.Message) - start it manually" "ERROR"
+                $result.Ok = $false
+            }
+        }
+    }
+    return $result
+}
+
+# ------------------------------------------------------------------ main
+
+function Invoke-Main {
+    Initialize-Output
+    $mode = "DIAGNOSE (read-only)"
+    if ($Fix) { $mode = "FIX" }
+    if ($Fix -and $RemoveStuckJobs) { $mode = "FIX + offer job deletion" }
+    Write-Log "fix-4x1 start - printer=$PrinterName ip=${PrinterIp}:$RawPort mode=$mode" "STEP"
+
+    if ($Fix -and -not (Test-IsAdmin)) {
+        Write-Log "-Fix needs an ADMIN PowerShell (Run as administrator). Nothing changed." "ERROR"
+        return 1
+    }
+
+    # 1. network -----------------------------------------------------
+    Write-Log "1) Network" "STEP"
+    if (-not (Test-Ping -Ip $PrinterIp)) {
+        Write-Log "Ping $PrinterIp FAILED - printer off, cable/switch, or IP changed. Nothing changed." "ERROR"
+        Write-Log "Check power + LAN light, print a self-test page to confirm IP. Windows cannot fix this."
+        Write-Log "Jobs stay queued and print when it is back - do NOT reprint them."
+        return 2
+    }
+    Write-Log "Ping OK" "OK"
+    if (-not (Test-RawPort -Ip $PrinterIp -Port $RawPort)) {
+        Write-Log "Ping OK but port $RawPort CLOSED - printer network stack is hung. Nothing changed." "ERROR"
+        Write-Log "Power-cycle the printer (off 10s, on), then run this script again."
+        Write-Log "Jobs stay queued and print when it is back - do NOT reprint them."
+        return 3
+    }
+    Write-Log "Port $RawPort OK" "OK"
+
+    # 2. Windows queue -----------------------------------------------
+    Write-Log "2) Windows printer queue" "STEP"
+    $snap = Get-PrinterSnapshot -Name $PrinterName
+    if (-not $snap) {
+        Write-Log "No Windows printer named '$PrinterName'. Nothing changed." "ERROR"
+        return 4
+    }
+    Write-Log ("Queue '{0}' port={1} host={2} status={3} useOffline={4} driver={5}" -f $snap.Name, $snap.PortName, $snap.Host, $snap.Status, $snap.WorkOffline, $snap.Driver)
+    if ($snap.Host -and $snap.Host -ne $PrinterIp) {
+        Write-Log "Queue port points to $($snap.Host), not $PrinterIp - fix the port, this script won't." "WARN"
+    }
+
+    try { $jobs = @(Get-QueueJobs -Name $PrinterName) } catch {
+        Write-Log "Cannot read print jobs: $($_.Exception.Message). Is the Spooler running?" "ERROR"
+        return 4
+    }
+    $stuck = @($jobs | Where-Object { $_.AgeMin -ge $StuckMinutes })
+    Write-Log "Jobs on $PrinterName : $($jobs.Count) (stuck >= ${StuckMinutes}min: $($stuck.Count))"
+    foreach ($j in $jobs) { Write-Log "  $(Format-Job $j)" }
+
+    # Other printers: a spooler restart touches them too.
+    $othersBusy = @()
+    $othersError = @()
+    try {
+        foreach ($n in (Get-AllPrinterNames)) {
+            if ($n -eq $PrinterName) { continue }
+            $oj = @()
+            try { $oj = @(Get-QueueJobs -Name $n) } catch { continue }
+            foreach ($j in $oj) {
+                if ($j.Status -match 'Error') { $othersError += $j }
+                elseif ($j.Status -match 'Printing|Spooling') { $othersBusy += $j }
+            }
+        }
+    } catch {}
+    foreach ($j in $othersBusy) { Write-Log "  other printer busy: [$($j.Printer)] $(Format-Job $j)" }
+
+    # 3. agent -------------------------------------------------------
+    Write-Log "3) Print agent" "STEP"
+    $svc = Find-AgentService
+    if ($svc) { Write-Log "Agent service '$($svc.Name)' is $($svc.Status)" } else { Write-Log "Agent service not found (NSSM AppParameters with printer.ps1). Pass -AgentServiceName." "WARN" }
+    $h = Get-AgentHealth
+    if ($h) { Write-Log "agent-health.json state=$($h.State) updated $($h.AgeSec)s ago" }
+
+    $needOnline = [bool]$snap.WorkOffline
+    $needSpooler = ($stuck.Count -gt 0)
+    if (-not $needOnline -and -not $needSpooler) {
+        Write-Log "Nothing stuck on $PrinterName. No action needed." "OK"
+        return 0
+    }
+
+    if (-not $Fix) {
+        Write-Log "Would do:" "STEP"
+        if ($needOnline) { Write-Log "  - turn off 'Use Printer Offline' on $PrinterName" }
+        if ($needSpooler) {
+            Write-Log "  - stop agent, stop Spooler, back up spool files, start Spooler, wait ${DrainWaitSeconds}s, start agent"
+            Write-Log "  - jobs are NOT deleted (only with -RemoveStuckJobs, asked one by one)"
+        }
+        Write-Log "Diagnose only - nothing changed. Run again with -Fix to do it." "OK"
+        return 0
+    }
+
+    # 4. fix: Use Printer Offline ------------------------------------
+    if ($needOnline) {
+        Write-Log "4) 'Use Printer Offline' is ON" "STEP"
+        if (Ask-User -Question "Turn off 'Use Printer Offline' on $PrinterName ?") {
+            try {
+                Set-PrinterOnline -Name $PrinterName
+                $again = Get-PrinterSnapshot -Name $PrinterName
+                if ($again -and -not $again.WorkOffline) { Write-Log "Printer set online" "OK" }
+                else { Write-Log "Still offline - uncheck it by hand: queue window > Printer > Use Printer Offline" "WARN" }
+            } catch {
+                Write-Log "Could not set online: $($_.Exception.Message)" "ERROR"
+            }
+            if ($stuck.Count -gt 0) {
+                Write-Log "Waiting up to ${DrainWaitSeconds}s for queue to drain"
+                $stuck = @(Wait-QueueDrain -Stuck $stuck -MaxSec $DrainWaitSeconds)
+            }
+        }
+        if ($stuck.Count -eq 0) {
+            Write-Log "No stuck jobs left. Done." "OK"
+            return 0
+        }
+    }
+
+    # 5. fix: spooler restart ----------------------------------------
+    Write-Log "5) $($stuck.Count) job(s) still stuck - spooler restart" "STEP"
+    Save-JobList -Jobs $stuck -Tag "stuck-before" | Out-Null
+    if ($othersBusy.Count -gt 0) {
+        Write-Log "$($othersBusy.Count) job(s) are printing on OTHER printers. A spooler restart can reprint a half-printed job from page 1." "WARN"
+        if (-not (Ask-User -Question "Restart anyway?" -DefaultNo)) {
+            Write-Log "Aborted by you. Nothing changed. Wait for the other printer and run again."
+            return 0
+        }
+    }
+    if ($othersError.Count -gt 0) {
+        Save-JobList -Jobs $othersError -Tag "other-printers-error" | Out-Null
+        Write-Log "Note: printer.ps1 purges Error jobs on its tracked printers when it starts. Listed in CSV above." "WARN"
+    }
+    if (-not (Ask-User -Question "Stop agent + restart Spooler now? (jobs are kept, spool files backed up)")) {
+        Write-Log "Aborted by you. Nothing changed."
+        return 0
+    }
+    if ($svc -and [string]$svc.Status -eq "Running") {
+        if (-not (Wait-AgentQuiet -MaxSec 60)) {
+            if (-not (Ask-User -Question "Agent still busy after 60s. Stop it anyway?" -DefaultNo)) {
+                Write-Log "Aborted by you. Nothing changed."
+                return 0
+            }
+        }
+    }
+    $r = Invoke-SpoolerRecovery -AgentSvc $svc -Stuck $stuck
+
+    # 6. summary -----------------------------------------------------
+    Write-Log "6) Summary" "STEP"
+    if (@($r.Removed).Count -gt 0) {
+        Write-Log "Deleted $(@($r.Removed).Count) job(s) - REPRINT them from meepo.win (force):" "WARN"
+        foreach ($j in $r.Removed) { Write-Log "  $(Format-Job $j)" "WARN" }
+    }
+    Write-Log "Check meepo.win for 4x1 labels marked printed in the last hour that never came out." "WARN"
+    Write-Log "Log: $script:LogPath"
+    if (-not $r.Ok) { return 5 }
+    if (@($r.Left).Count -gt 0) { return 6 }
+    Write-Log "Recovered." "OK"
+    return 0
+}
+
+if (-not $LibOnly) {
+    $code = Invoke-Main
+    exit ([int](@($code)[-1]))
+}
