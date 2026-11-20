@@ -1,0 +1,213 @@
+#!/bin/bash
+# =============================================================================
+# disable_startup.command   —   MeePo Tek   (v2, 2026-11-19)
+# Tắt các chương trình tự chạy khi boot/đăng nhập trên các ổ macOS gắn ngoài:
+#   1. LaunchDaemons / LaunchAgents của TechTool (Micromat)
+#      - cấp máy  : Library/LaunchDaemons, Library/LaunchAgents
+#      - cấp user : Users/*/Library/LaunchAgents          (mới ở v2)
+#   2. Login Items (Mở khi đăng nhập) — vd test.command, TechTool Pro 20 (mới ở v2)
+#      - Catalina..Monterey: Users/*/Library/Application Support/
+#            com.apple.backgroundtaskmanagementagent/backgrounditems.btm
+#      - Ventura trở lên  : private/var/db/com.apple.backgroundtaskmanagement/
+#            BackgroundItems-v*.btm
+#      File .btm chứa CẢ DANH SÁCH Login Items của user đó, nên dời file là tắt
+#      HẾT Login Items (vd MachineProfile cũng mất, muốn thì thêm lại tay).
+#      Chỉ dời .btm nào có chứa tên khớp LOGIN_PAT bên dưới.
+#   3. (-g) Google Updater / Keystone
+#
+# Không xoá gì: file được dời vào <volume>/Users/Shared/disabled-startup/
+# (giữ nguyên đường dẫn gốc bên trong) để bật lại bằng --restore.
+#
+# Ổ đang chạy máy: nếu máy đang BOOT TỪ Ổ NGOÀI (USB/SSD) thì ổ đó cũng được
+# xử lý (v1 bỏ qua nó). Login Items của ổ đang chạy được gỡ bằng System Events
+# (không --restore được, script in ra đường dẫn để thêm lại tay).
+#
+# Cách dùng:
+#   sudo bash disable_startup.command                 # quét TẤT CẢ ổ ngoài đang gắn
+#   sudo bash disable_startup.command MeePoCata       # chỉ 1 (hoặc vài) volume
+#   sudo bash disable_startup.command -g              # tắt luôn Google Updater
+#   sudo bash disable_startup.command -r MeePoCata    # bật lại (restore)
+# =============================================================================
+set -u
+shopt -s nullglob
+
+# Login Items có tên/đường dẫn khớp mẫu này thì bị tắt (không phân biệt hoa thường)
+LOGIN_PAT='techtool|micromat|test\.command'
+
+usage() {
+  sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# Tự xin quyền root nếu chưa có
+if [ "$(id -u)" -ne 0 ]; then
+  exec sudo bash "$0" "$@"
+fi
+
+MODE="disable"
+GOOGLE=0
+VOLS=()
+for a in "$@"; do
+  case "$a" in
+    -g|--google)  GOOGLE=1 ;;
+    -r|--restore) MODE="restore" ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            VOLS+=("$a") ;;
+  esac
+done
+
+# Ổ đang chạy máy có phải ổ ngoài không?
+BOOT_EXTERNAL=0
+diskutil info / 2>/dev/null | grep -Eq "Device Location: +External" && BOOT_EXTERNAL=1
+BOOT_NAME="$(diskutil info / 2>/dev/null | awk -F': *' '/Volume Name/{print $2; exit}')"
+
+# Từ tên volume -> thư mục gốc chứa Library/Users
+# Catalina trở lên: dùng "<tên> - Data" (volume ghi được); bản cũ: dùng chính volume
+# Ổ đang chạy máy -> "" (tức là "/")
+resolve_root() {
+  local v="${1#/Volumes/}"
+  v="${v%/}"
+  v="${v% - Data}"
+  if [ -n "$BOOT_NAME" ] && [ "$v" = "$BOOT_NAME" ] && [ -L "/Volumes/$v" -o ! -e "/Volumes/$v" ]; then
+    echo "/"          # ổ đang chạy
+  elif [ -d "/Volumes/$v - Data/Library" ]; then
+    echo "/Volumes/$v - Data"
+  elif [ -d "/Volumes/$v/Library" ]; then
+    echo "/Volumes/$v"
+  fi
+}
+
+# Không có tên volume -> tự tìm mọi ổ macOS gắn ngoài (+ ổ đang chạy nếu là ổ ngoài)
+if [ ${#VOLS[@]} -eq 0 ]; then
+  for p in /Volumes/*; do
+    [ -L "$p" ] && continue          # ổ đang chạy máy (symlink -> /), xử lý riêng bên dưới
+    VOLS+=("$(basename "$p")")
+  done
+  [ $BOOT_EXTERNAL -eq 1 ] && [ -n "$BOOT_NAME" ] && VOLS+=("$BOOT_NAME")
+fi
+
+# Lọc ra danh sách root, bỏ trùng
+ROOTS=()
+for v in "${VOLS[@]+"${VOLS[@]}"}"; do
+  r="$(resolve_root "$v")"
+  [ -z "$r" ] && continue
+  [ "$r" = "/" ] && [ $BOOT_EXTERNAL -eq 0 ] && { echo "Bỏ qua '$v': là ổ TRONG đang chạy máy."; continue; }
+  b="${r%/}"
+  [ -d "$b/Library/LaunchDaemons" ] || [ -d "$b/Library/LaunchAgents" ] || [ -d "$b/Users" ] || continue
+  dup=0
+  for x in "${ROOTS[@]+"${ROOTS[@]}"}"; do [ "$x" = "$r" ] && dup=1; done
+  [ $dup -eq 0 ] && ROOTS+=("$r")
+done
+
+if [ ${#ROOTS[@]} -eq 0 ]; then
+  echo "Không tìm thấy volume macOS nào phù hợp. Kiểm tra: ls /Volumes"
+  exit 1
+fi
+
+# Dời 1 file vào disabled-startup, giữ đường dẫn tương đối
+move_out() { # <base> <file>
+  local base="$1" f="$2" dest="$1/Users/Shared/disabled-startup" rel
+  rel="${f#"$base"/}"
+  mkdir -p "$dest/$(dirname "$rel")"
+  if [ -e "$dest/$rel" ]; then
+    echo "  ! Đã có bản trong disabled-startup, bỏ qua: $rel"
+    return 1
+  fi
+  mv "$f" "$dest/$rel" && echo "  - Đã tắt: $rel"
+}
+
+# Gỡ Login Items trên ổ ĐANG CHẠY (file .btm đang được macOS giữ, không dời được)
+disable_login_items_live() {
+  local u="${SUDO_USER:-}" line n=0
+  if [ -z "$u" ] || [ "$u" = "root" ]; then
+    echo "  ? Không biết user đang đăng nhập, bỏ qua Login Items."
+    return
+  fi
+  while IFS=$'\t' read -r name path; do
+    [ -z "$name" ] && continue
+    if printf '%s %s' "$name" "$path" | grep -Eiq "$LOGIN_PAT"; then
+      sudo -u "$u" osascript -e "tell application \"System Events\" to delete login item \"$name\"" >/dev/null 2>&1 \
+        && { echo "  - Đã gỡ Login Item: $name  ($path)"; n=$((n+1)); } \
+        || echo "  ! Không gỡ được Login Item: $name (gỡ tay trong System Settings > General > Login Items)"
+    fi
+  done < <(sudo -u "$u" osascript -e '
+    set out to ""
+    tell application "System Events"
+      repeat with li in login items
+        set out to out & (name of li) & tab & (path of li) & linefeed
+      end repeat
+    end tell
+    return out' 2>/dev/null)
+  echo "  => Gỡ $n Login Item (muốn bật lại: thêm tay trong Login Items)."
+}
+
+disable_root() {
+  local root="$1" base="${1%/}" n=0 f
+  local items=(
+    "$base"/Library/LaunchDaemons/com.micromat.*.plist
+    "$base"/Library/LaunchAgents/com.micromat.*.plist
+    "$base"/Library/LaunchAgents/TechTool*.plist
+    "$base"/Users/*/Library/LaunchAgents/com.micromat.*.plist
+    "$base"/Users/*/Library/LaunchAgents/TechTool*.plist
+  )
+  if [ $GOOGLE -eq 1 ]; then
+    items+=(
+      "$base"/Library/LaunchAgents/com.google.*.plist
+      "$base"/Library/LaunchDaemons/com.google.*.plist
+      "$base"/Users/*/Library/LaunchAgents/com.google.*.plist
+    )
+  fi
+
+  # Login Items (.btm) — chỉ với ổ KHÔNG đang chạy
+  if [ "$root" != "/" ]; then
+    for f in "$base"/Users/*/Library/Application\ Support/com.apple.backgroundtaskmanagementagent/backgrounditems.btm \
+             "$base"/private/var/db/com.apple.backgroundtaskmanagement/BackgroundItems-v*.btm; do
+      if LC_ALL=C grep -aEiq "$LOGIN_PAT" "$f"; then
+        echo "  * Login Items khớp '$LOGIN_PAT' trong: ${f#"$base"/}"
+        LC_ALL=C grep -aoE '[[:print:]]{4,}' "$f" | grep -Ei '\.app$|\.command$' | grep -v -e '^/' -e ';' | sort -u | sed 's/^/      (sẽ tắt hết) /'
+        items+=("$f")
+      fi
+    done
+  fi
+
+  for f in "${items[@]+"${items[@]}"}"; do
+    [ -e "$f" ] || continue
+    move_out "$base" "$f" && n=$((n+1))
+  done
+  echo "  => Tắt $n mục."
+
+  [ "$root" = "/" ] && disable_login_items_live
+}
+
+restore_root() {
+  local base="${1%/}" dest="${1%/}/Users/Shared/disabled-startup" n=0 rel target
+  if [ ! -d "$dest" ]; then
+    echo "  Không có thư mục disabled-startup."
+    return
+  fi
+  while IFS= read -r rel; do
+    rel="${rel#./}"
+    case "$rel" in
+      */*)               target="$base/$rel" ;;
+      TechTool*.plist)   target="$base/Library/LaunchAgents/$rel" ;;   # kiểu cũ (để phẳng)
+      com.micromat.*)    target="$base/Library/LaunchDaemons/$rel" ;;
+      *) echo "  ? Không biết chỗ gốc, bỏ qua: $rel"; continue ;;
+    esac
+    if [ -e "$target" ]; then
+      echo "  ! Đã tồn tại (macOS đã tạo file mới?), bỏ qua: ${target#"$base"/}"
+      continue
+    fi
+    mkdir -p "$(dirname "$target")"
+    mv "$dest/$rel" "$target" && echo "  + Đã bật lại: ${target#"$base"/}" && n=$((n+1))
+  done < <(cd "$dest" && find . -type f \( -name '*.plist' -o -name '*.btm' \))
+  echo "  => Bật lại $n mục."
+}
+
+for r in "${ROOTS[@]}"; do
+  if [ "$r" = "/" ]; then echo "== / (ổ ngoài ĐANG CHẠY: $BOOT_NAME) =="; else echo "== $r =="; fi
+  if [ "$MODE" = "restore" ]; then
+    restore_root "$r"
+  else
+    disable_root "$r"
+  fi
+done
+echo "Xong."

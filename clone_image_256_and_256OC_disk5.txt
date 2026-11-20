@@ -1,0 +1,383 @@
+#!/bin/bash
+#================================================================
+#  clone_image_to_disk_5.command   —   MeePo Tek
+#  Clone 1 image macOS nhiều phan vung sang 1 disk dich,
+#  TU DONG doc layout cua image (ten/size that su — khong
+#  hard-code gi ca), nen chay dung cho image doi nay va sau nay.
+#
+#  Source : .dmg / .sparseimage / .img tren ~/Desktop hoac tren USB (/Volumes/<ten>/)
+#  Target : 1 disk NGOAI (hoac 1 sparseimage ao de TEST truoc)
+#
+#  Cach clone tung phan vung:
+#     Apple_HFS   -> dd               (raw)
+#     EFI         -> dd               (raw, bat/tat bang CLONE_EFI)
+#     Apple_Boot  -> dd               (raw)
+#     Apple_APFS  -> dd + resize      (nở đầy ổ)
+#
+#  v3 (2026-10-25):
+#   - phan vung dich tao dang KHONG FORMAT, dung loai cua image
+#     (%Apple_HFS% / %Apple_Boot% / %Apple_APFS%) -> khong auto-mount,
+#     het "Resource busy", Apple_Boot giu dung loai
+#   - bo asr: asr tu cat phan vung de tao Recovery (Apple_Boot) -> lech layout
+#   - dem loi; co loi thi KHONG bao "HOAN TAT"
+#   - resize APFS tu dong: thu "0", loi -69743 thi resize ve size cu the
+#     (partition - 1GB); van loi moi nhac rut/cam lai
+#
+#  v4 (2026-10-27): image 256GB (them Install macOS Sequoia + Tahoe)
+#   - cac phan vung cu GIU NGUYEN size nhu image (+ dem nho)
+#   - phan du cua o dich (vd SSD 512GB) -> tao 1 volume MOI "FreeSpace"
+#     o cuoi o; o dich cung co voi master thi khong tao
+#   - PAD tu dong co gian: o dich CUNG CO voi master (250GB) van clone duoc
+#     (v3 cong cung 500MB x 8 phan vung -> bao "o dich nho hon" va huy)
+#   - resize APFS: khong bao gio thu nho container; ho tro nhieu container
+#================================================================
+set -u
+
+# ---- tuy chinh ------------------------------------------------
+PAD_MAX=524288000       # dem toi da +500MB cho moi phan vung
+PAD_MIN=16777216        # dem toi thieu +16MB (it hon thi o dich qua nho)
+MARGIN=268435456        # chua 256MB cho GPT / canh le
+FREE_NAME="FreeSpace"   # ten volume moi chua phan du
+FREE_FMT="APFS"         # dinh dang: APFS | JHFS+ | ExFAT (ExFAT doc duoc tren Windows)
+FREE_MIN=2000000000     # phan du < 2GB thi khong tao FreeSpace
+CLONE_EFI=1             # 1 = clone noi dung EFI; 0 = de EFI trong (diskutil tu tao)
+# --------------------------------------------------------------
+MB=1048576
+gb() { awk -v b="$1" 'BEGIN{printf "%.1f GB", b/1000000000}'; }
+
+RED=$'\033[31;1m'; GRN=$'\033[32;1m'; YEL=$'\033[33;1m'; CYN=$'\033[36;1m'; NC=$'\033[0m'
+say()  { echo -e "${CYN}$*${NC}"; }
+ok()   { echo -e "${GRN}$*${NC}"; }
+warn() { echo -e "${YEL}$*${NC}"; }
+die()  { echo -e "${RED}$*${NC}" >&2; exit 1; }
+FAILS=()
+RESIZE_LIST=()
+fail() { echo -e "${RED}   ! $*${NC}"; FAILS+=("$*"); }
+
+# 0. sudo
+if [[ $EUID -ne 0 ]]; then
+  exec sudo "$0" "$@"
+fi
+SUDO_HOME=$(eval echo "~${SUDO_USER:-$USER}")
+
+# helper: doc 1 khoa trong plist cua `diskutil info`
+dkey() { # <device> <PlistKey>
+  local t; t=$(mktemp)
+  diskutil info -plist "$1" > "$t" 2>/dev/null
+  plutil -extract "$2" raw -o - "$t" 2>/dev/null
+  rm -f "$t"
+}
+# liet ke cac slice (diskNsM) cua 1 whole disk, dung thu tu
+list_slices() { # <wholeDisk>
+  diskutil list "$1" | awk '$NF ~ /^disk[0-9]+s[0-9]+$/ {print $NF}'
+}
+
+#================================================================
+# 1. Chon file image
+#================================================================
+# Tim image tren Desktop VA o thu muc goc cua cac o gan ngoai (USB)
+echo "=== IMAGE TIM THAY (Desktop + USB) ==="
+IMGS=()
+shopt -s nullglob
+for f in "$SUDO_HOME/Desktop/"*.dmg "$SUDO_HOME/Desktop/"*.sparseimage "$SUDO_HOME/Desktop/"*.img \
+         /Volumes/*/*.dmg /Volumes/*/*.sparseimage /Volumes/*/*.img; do
+  IMGS+=("$f")
+done
+shopt -u nullglob
+for i in "${!IMGS[@]}"; do
+  echo "  $((i+1))) ${IMGS[$i]}"
+done
+[[ ${#IMGS[@]} -eq 0 ]] && echo "  (khong thay image nao)"
+echo ""
+echo "Nhap SO thu tu o tren, hoac keo-tha file image vao day:"
+read -r -p "> " IMAGE
+IMAGE="${IMAGE%"${IMAGE##*[![:space:]]}"}"   # bo khoang trang cuoi (khi keo-tha)
+IMAGE="${IMAGE//\\ / }"                       # bo dau \ truoc khoang trang (khi keo-tha)
+if [[ "$IMAGE" =~ ^[0-9]+$ ]] && (( IMAGE >= 1 && IMAGE <= ${#IMGS[@]} )); then
+  IMAGE_PATH="${IMGS[$((IMAGE-1))]}"
+elif [[ "$IMAGE" == /* ]]; then
+  IMAGE_PATH="$IMAGE"
+else
+  IMAGE_PATH="$SUDO_HOME/Desktop/$IMAGE"
+fi
+[[ -f "$IMAGE_PATH" ]] || die "X Khong thay file: $IMAGE_PATH"
+ok "# Image: $IMAGE_PATH"
+# o vat ly dang chua file image (de khong cho chon nham lam o dich)
+SRC_WHOLE=$(diskutil info "$(df "$IMAGE_PATH" | awk 'NR==2{print $1}')" 2>/dev/null | awk -F: '/Part of Whole/{gsub(/[[:space:]]/,"",$2);print $2}')
+
+say "* Dang attach image (read-only, khong mount)..."
+ATT=$(hdiutil attach -nomount -noverify -readonly "$IMAGE_PATH") || die "X Attach that bai."
+IMG_DEV=$(echo "$ATT" | awk '/GUID_partition_scheme/{print $1; exit}')
+[[ -n "$IMG_DEV" ]] || { echo "$ATT"; die "X Khong thay GUID_partition_scheme trong image."; }
+IMG_DISK=${IMG_DEV#/dev/}
+ok "# Image dang o: /dev/$IMG_DISK"
+echo ""
+diskutil list "/dev/$IMG_DISK"
+echo ""
+
+#================================================================
+# 2. Chon disk dich
+#================================================================
+echo "=== DISK NGOAI / AO ==="
+diskutil list external physical 2>/dev/null | grep "/dev/disk"
+echo ""
+read -r -p "Nhap disk DICH (vi du disk6): " TGT
+TGT=${TGT#/dev/}
+[[ "$TGT" =~ ^disk[0-9]+$ ]] || die "X Dinh dang sai, can kieu diskN (vd disk6)."
+
+# ---- AN TOAN: khong xoa nham o he thong ----
+[[ "$TGT" == "$IMG_DISK" ]] && die "X Dich trung voi image. Huy."
+[[ -n "${SRC_WHOLE:-}" && "$TGT" == "$SRC_WHOLE" ]] && die "X $TGT la o dang CHUA FILE IMAGE (USB). Chon o khac. Huy."
+BOOT_WHOLE=$(diskutil info / 2>/dev/null | awk -F: '/Part of Whole/{gsub(/[[:space:]]/,"",$2);print $2}')
+[[ "$TGT" == "$BOOT_WHOLE" ]] && die "X $TGT la o dang chay macOS. TUYET DOI khong. Huy."
+LOC=$(diskutil info "/dev/$TGT" 2>/dev/null | awk -F: '/Device Location/{gsub(/^[ \t]+/,"",$2);print $2}')
+[[ "$LOC" == "Internal" ]] && die "X $TGT la o Internal. Huy de an toan."
+
+echo ""
+diskutil list "/dev/$TGT"
+echo ""
+TGT_SIZE=$(dkey "/dev/$TGT" Size)
+[[ -n "$TGT_SIZE" ]] || die "X Khong doc duoc dung luong dich."
+
+#================================================================
+# 3. Doc layout image -> mang
+#================================================================
+SRC=(); C_CONTENT=(); C_SIZE=(); C_NAME=()
+while IFS= read -r s; do
+  SRC+=("$s")
+  C_CONTENT+=("$(dkey "/dev/$s" Content)")
+  C_SIZE+=("$(dkey "/dev/$s" Size)")
+  C_NAME+=("$(dkey "/dev/$s" VolumeName)")
+done < <(list_slices "/dev/$IMG_DISK")
+[[ ${#SRC[@]} -gt 0 ]] || die "X Khong doc duoc phan vung nao tu image."
+
+# cac phan vung se tao (bo EFI vi GPT tu tao)
+NONEFI_IDX=(); EFI_SZ=209715200; SUM=0
+for i in "${!SRC[@]}"; do
+  if [[ "${C_CONTENT[$i]}" == "EFI" ]]; then
+    [[ -n "${C_SIZE[$i]}" ]] && EFI_SZ="${C_SIZE[$i]}"
+    continue
+  fi
+  NONEFI_IDX+=("$i")
+  SUM=$(( SUM + ${C_SIZE[$i]:-0} ))
+done
+N=${#NONEFI_IDX[@]}
+LAST_POS=$(( N - 1 ))
+
+# ---- tinh dem (PAD) va phan du ----
+NEED_MIN=$(( EFI_SZ + SUM + MARGIN + N * PAD_MIN ))
+[[ $NEED_MIN -le $TGT_SIZE ]] || die "X O dich $(gb "$TGT_SIZE") nho hon muc toi thieu $(gb "$NEED_MIN"). Huy."
+SLACK=$(( TGT_SIZE - EFI_SZ - SUM - MARGIN ))
+PAD=$(( SLACK / N ))
+[[ $PAD -gt $PAD_MAX ]] && PAD=$PAD_MAX
+PAD=$(( PAD / MB * MB ))                 # canh 1MB
+EXTRA=$(( SLACK - N * PAD ))
+EXTRA=$(( EXTRA / MB * MB ))
+
+# phan du du lon -> them volume FreeSpace o cuoi
+MAKE_FREE=0
+[[ $EXTRA -ge $FREE_MIN ]] && MAKE_FREE=1
+
+# build args cho partitionDisk
+PARGS=(); pos=0
+for i in "${NONEFI_IDX[@]}"; do
+  c="${C_CONTENT[$i]}"; nm="${C_NAME[$i]}"; sz="${C_SIZE[$i]}"
+  # Tao MOI phan vung o dang KHONG format, giu dung loai cua image
+  # (%Apple_HFS%, %Apple_Boot%, %Apple_APFS%...). macOS khong tu mount gi ca,
+  # dd ghi vao khong bi "Resource busy", va Apple_Boot giu dung loai Apple_Boot.
+  fmt="%${c}%"
+  [[ -n "$nm" ]] || nm="Part$((pos+1))"
+  if [[ $pos -eq $LAST_POS && $MAKE_FREE -eq 0 ]]; then
+    tok="0b"                     # khong co FreeSpace: phan vung cuoi lay phan con lai
+  else
+    tok="$(( sz + PAD ))b"
+  fi
+  PARGS+=( "$fmt" "$nm" "$tok" )
+  pos=$(( pos + 1 ))
+done
+# volume moi FreeSpace (duoc format san, khong clone gi vao)
+[[ $MAKE_FREE -eq 1 ]] && PARGS+=( "$FREE_FMT" "$FREE_NAME" "0b" )
+
+#================================================================
+# 4. Xac nhan
+#================================================================
+echo "=============================================================="
+warn "SE XOA TOAN BO /dev/$TGT ($(gb "$TGT_SIZE")) va tao layout:"
+echo "   - EFI (tao tu dong)"
+pos=0
+for i in "${NONEFI_IDX[@]}"; do
+  fill=""
+  [[ $pos -eq $LAST_POS && $MAKE_FREE -eq 0 ]] && fill="  [phan con lai]"
+  nm="${C_NAME[$i]}"; [[ -n "$nm" ]] || nm="(container APFS)"
+  echo "   - ${C_CONTENT[$i]}  '$nm'  ($(gb "${C_SIZE[$i]}"))$fill"
+  pos=$((pos+1))
+done
+if [[ $MAKE_FREE -eq 1 ]]; then
+  echo "   - $FREE_FMT  '$FREE_NAME'  (~$(gb "$EXTRA"))  [MOI, phan con lai]"
+else
+  echo "   (phan du chi $(gb "$EXTRA") -> khong tao $FREE_NAME)"
+fi
+echo "   Dem moi phan vung: +$(( PAD / MB )) MB"
+echo "=============================================================="
+echo "Lenh: diskutil partitionDisk /dev/$TGT GPT ${PARGS[*]}"
+echo ""
+read -r -p "Go dung '$TGT' de xac nhan XOA va clone: " CONF
+[[ "$CONF" == "$TGT" ]] || die "X Khong khop. Huy."
+
+#================================================================
+# 5. Tao phan vung
+#================================================================
+# Thao sach o dich: tat Spotlight (mds) tren cac volume cua no, ep thao
+# moi volume + container APFS. Spotlight hay bam vao o vua clone do dang
+# -> partitionDisk bao "in use by process (mds)".
+release_target() {
+  local conts devs mp
+  conts=$(diskutil list "/dev/$TGT" 2>/dev/null | awk '/Container disk[0-9]+/ {for(i=1;i<=NF;i++) if($i=="Container") print $(i+1)}')
+  devs="$TGT"; for c in $conts; do devs="$devs|$c"; done
+  mount | grep -E "^/dev/($devs)s[0-9]+" | sed -E 's/^.* on (.*) \([^()]*\)$/\1/' | while IFS= read -r mp; do
+    mdutil -i off "$mp" >/dev/null 2>&1
+  done
+  for c in $conts; do diskutil unmountDisk force "/dev/$c" >/dev/null 2>&1; done
+  diskutil unmountDisk force "/dev/$TGT" >/dev/null 2>&1
+}
+
+say "* Dang phan vung /dev/$TGT ..."
+PART_OK=0
+for try in 1 2 3; do
+  release_target
+  sleep 3
+  if diskutil partitionDisk "/dev/$TGT" GPT "${PARGS[@]}"; then PART_OK=1; break; fi
+  warn "   ~ O dang bi giu (Spotlight/mds?), thu lai lan $((try+1))/3 sau 10s..."
+  sleep 10
+done
+[[ $PART_OK -eq 1 ]] || die "X partitionDisk loi sau 3 lan. Rut o ra, cam lai roi chay lai."
+
+TGTS=()
+while IFS= read -r s; do TGTS+=("$s"); done < <(list_slices "/dev/$TGT")
+[[ ${#TGTS[@]} -ge $(( ${#NONEFI_IDX[@]} + 1 )) ]] || die "X So phan vung dich khong khop."
+
+#================================================================
+# 6. Clone tung phan vung
+#================================================================
+nef=0
+for i in "${!SRC[@]}"; do
+  s="${SRC[$i]}"; c="${C_CONTENT[$i]}"; nm="${C_NAME[$i]}"
+  if [[ "$c" == "EFI" ]]; then
+    t="${TGTS[0]}"
+    if [[ "$CLONE_EFI" == "1" ]]; then
+      say ">> EFI  $s -> $t (dd)"
+      diskutil unmount "/dev/$t" >/dev/null 2>&1
+      dd if="/dev/r$s" of="/dev/r$t" bs=4m 2>/dev/null && ok "   OK EFI" || warn "   ! EFI dd loi (bo qua)"
+    else
+      warn "~ Bo qua EFI (de trong)."
+    fi
+    continue
+  fi
+  t="${TGTS[$(( nef + 1 ))]}"; nef=$(( nef + 1 ))
+  # O dich con ket noi khong? (USB/box co the bi rot giua chung)
+  if [[ "$(dkey "/dev/$TGT" Size)" != "$TGT_SIZE" ]]; then
+    fail "O dich /dev/$TGT bi NGAT KET NOI hoac doi so disk (truoc khi chep '$nm')"
+    warn "   Dung lai. Kiem tra cap/cong USB, cam lai, roi chay lai script tu dau."
+    break
+  fi
+  case "$c" in
+    Apple_HFS)
+      # KHONG dung asr: voi volume co Recovery (Apple_Boot) di kem, asr tu y
+      # cat nho phan vung dich de tao them Apple_Boot -> lech het layout.
+      # dd raw: chep nguyen khoi, layout giu dung nhu image.
+      say ">> HFS  '$nm'  $s -> $t (dd)  — Ctrl-T xem tien do"
+      diskutil unmount force "/dev/$t" >/dev/null 2>&1
+      dd if="/dev/r$s" of="/dev/r$t" bs=4m && ok "   OK $nm" || fail "HFS '$nm' dd loi ($s -> $t)"
+      ;;
+    Apple_Boot)
+      say ">> Boot $s -> $t (dd)  — Ctrl-T xem tien do"
+      diskutil unmount "/dev/$t" >/dev/null 2>&1
+      dd if="/dev/r$s" of="/dev/r$t" bs=4m && ok "   OK Boot" || fail "Boot dd loi ($s -> $t)"
+      ;;
+    Apple_APFS)
+      say ">> APFS '$nm'  $s -> $t (dd)  — Ctrl-T xem tien do"
+      # neu lo co container (vd chay script cu) -> thao het volume cua no truoc
+      cont=$(dkey "/dev/$t" APFSContainerReference)
+      [[ -n "$cont" ]] && diskutil unmountDisk force "/dev/$cont" >/dev/null 2>&1
+      diskutil unmount force "/dev/$t" >/dev/null 2>&1
+      # Do kich thuoc phan vung TRUOC khi ghi (luc o con on dinh)
+      PSIZE=$(dkey "/dev/$t" Size)
+      CSIZE=${C_SIZE[$i]:-0}
+      if ! dd if="/dev/r$s" of="/dev/r$t" bs=4m; then
+        fail "dd APFS loi ($s -> $t)"
+        continue
+      fi
+      ok "   OK dd container"
+      sync
+      # Phan vung chi lon hon container chut it (dem <= 2GB) -> KHONG can resize.
+      # Bo qua buoc thao/gan lai ca o: voi USB flash, gan lai ngay sau khi ghi
+      # lon hay lam USB bi treo va tu ngat ket noi.
+      if [[ -n "$PSIZE" && $(( PSIZE - CSIZE )) -le 2000000000 ]]; then
+        ok "   OK (phan vung lon hon $(( (PSIZE - CSIZE) / MB )) MB, khong can resize)"
+        continue
+      fi
+      # Phan vung lon hon nhieu -> moi resize. Doi o ghi xong roi moi gan lai.
+      sleep 15
+      diskutil unmountDisk force "/dev/$TGT" >/dev/null 2>&1
+      diskutil mountDisk "/dev/$TGT" >/dev/null 2>&1
+      sleep 5
+      say "   ... resize container lap day phan vung"
+      # Sau khi dd, "resizeContainer 0" hay bao -69743 (size giong nhau) vi
+      # diskutil lay size partition lam moc. Meo: resize ve 1 size CU THE
+      # (nho hon partition 1GB) -> APFS nhan va no container ra.
+      PSIZE=$(dkey "/dev/$t" Size)
+      if [[ -z "$PSIZE" || $PSIZE -lt $CSIZE ]]; then
+        fail "Doc kich thuoc $t sai (${PSIZE:-rong}) — o dich co the vua bi ngat ket noi"
+        continue
+      fi
+      RS_G=$(( ${PSIZE:-0} / 1000000000 - 1 ))
+      if diskutil apfs resizeContainer "$t" 0 >/dev/null 2>&1; then
+        ok "   OK resize (lap day)"
+      elif [[ $RS_G -gt 0 && $(( RS_G * 1000000000 )) -gt $CSIZE ]]; then
+        if diskutil apfs resizeContainer "$t" "${RS_G}g"; then
+          ok "   OK resize -> ${RS_G}GB"
+        else
+          RESIZE_LIST+=("$t ${RS_G}g")
+          warn "   ~ macOS chua nhan container moi -> resize sau khi rut/cam lai o (xem cuoi)"
+        fi
+      else
+        ok "   OK (phan vung chi lon hon $(( (${PSIZE:-0} - CSIZE) / MB )) MB, khong can resize)"
+      fi
+      ;;
+    *)
+      say ">> $c  $s -> $t (dd)"
+      diskutil unmount "/dev/$t" >/dev/null 2>&1
+      dd if="/dev/r$s" of="/dev/r$t" bs=4m && ok "   OK" || fail "$c dd loi ($s -> $t)"
+      ;;
+  esac
+done
+
+#================================================================
+# 7. Don dep + ket qua
+#================================================================
+say "* Thao image..."
+hdiutil detach "/dev/$IMG_DISK" >/dev/null 2>&1
+# KHONG thao/gan lai o dich sau khi ghi: voi USB flash, gan lai ngay sau khi
+# ghi lon lam USB treo va tu ngat ket noi. Chi sync, roi de nguoi dung
+# rut ra cam lai (macOS se nhan dung ten cac phan vung).
+say "* Dang ghi not du lieu xuong o dich (sync)..."
+sync
+echo ""
+if [[ ${#FAILS[@]} -gt 0 ]]; then
+  echo -e "${RED}X CLONE CHUA XONG — ${#FAILS[@]} loi:${NC}"
+  for f in "${FAILS[@]}"; do echo -e "${RED}   - $f${NC}"; done
+  echo "  Kiem tra:  diskutil list /dev/$TGT"
+  exit 1
+fi
+ok "V CLONE XONG! /dev/$TGT khong co loi."
+[[ $MAKE_FREE -eq 1 ]] && ok "  + Volume moi '$FREE_NAME' (~$(gb "$EXTRA"), $FREE_FMT)"
+if [[ ${#RESIZE_LIST[@]} -gt 0 ]]; then
+  warn ">> CON 1 BUOC: rut o ra, cam lai, roi chay (doi so disk neu bi doi):"
+  echo "     diskutil list external"
+  for r in "${RESIZE_LIST[@]}"; do
+    echo "     sudo diskutil apfs resizeContainer $r"
+  done
+fi
+warn ">> Doi 30 giay, eject o, rut ra cam lai, roi kiem tra (so disk co the doi):"
+echo "     diskutil eject /dev/$TGT"
+echo "     diskutil list external physical"
